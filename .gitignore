@@ -1,1 +1,12 @@
 otlp-log-processor-backend
+
+# Vendored agent skills (Matt Pocock's skills) — local harness tooling, not part of the public submission
+.claude/skills/
+.claude/settings.local.json
+skills-lock.json
+
+# Personal strategy notes — not part of the public submission
+PERSONAL-NOTES.md
+
+# Full third-party article kept locally for agent context, not redistributed (cited instead)
+docs/reference/dash0-blog-post.full.md
