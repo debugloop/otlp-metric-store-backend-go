@@ -125,3 +125,7 @@ same friction forces the attribute maps to be `Map(String, String)`, not `Map(Lo
 String)`: `anyLast` returns the plain map type, so ClickHouse rejects a `LowCardinality` key inside a
 `SimpleAggregateFunction`. A scalar `LowCardinality` such as `MetricType` is unaffected.
 
+## 9. Schema Bootstrap and Migrations
+We bootstrap the schema with `CREATE TABLE IF NOT EXISTS` on startup: idempotent and dependency-free,
+but not production ready, there is no migration or backfill path. Deferred for this assignment.
+
