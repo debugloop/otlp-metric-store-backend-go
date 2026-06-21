@@ -49,7 +49,14 @@ func setupClickHouse(t *testing.T) (*ClickHouseMetricsStore, func()) {
 	}
 
 	addr := fmt.Sprintf("%s:%s", host, mappedPort.Port())
-	store, err := NewClickHouseMetricsStore(ctx, addr, "default", "default", "test")
+	store, err := NewClickHouseMetricsStore(ctx, ClickHouseConfig{
+		Addr:          addr,
+		Database:      "default",
+		Username:      "default",
+		Password:      "test",
+		MaxOpenConns:  8,
+		InsertTimeout: 30 * time.Second,
+	})
 	if err != nil {
 		t.Fatalf("creating clickhouse metrics store: %v", err)
 	}
