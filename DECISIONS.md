@@ -129,3 +129,9 @@ String)`: `anyLast` returns the plain map type, so ClickHouse rejects a `LowCard
 We bootstrap the schema with `CREATE TABLE IF NOT EXISTS` on startup: idempotent and dependency-free,
 but not production ready, there is no migration or backfill path. Deferred for this assignment.
 
+## 10. In-Go Metadata Deduplication, Keyed by (MetricHash, Day)
+We deduplicate metadata rows in Go per request, keyed by `(MetricHash, day)` and folding
+`FirstSeen`/`LastSeen`, to cut write amplification before the AggregatingMergeTree merges.
+We can not do cross-request deduplication without handling `LastSeen` properly, we would either need
+a separate table for it, or accept a cache's TTL as an upper bound for inaccuracy.
+
