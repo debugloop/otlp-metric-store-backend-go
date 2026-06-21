@@ -25,6 +25,14 @@ func (m *dash0MetricsServiceServer) Export(ctx context.Context, request *colmetr
 	if m.store != nil {
 		rm := request.GetResourceMetrics()
 
+		// Metadata first: with no cross-table transaction, an orphan metadata
+		// row from a later failure is harmless, but orphan datapoints would
+		// break the join.
+		if metaRows := MapMetadataRows(rm); len(metaRows) > 0 {
+			if err := m.store.InsertMetadata(ctx, metaRows); err != nil {
+				return nil, err
+			}
+		}
 		if gaugeRows := MapGaugeRows(rm); len(gaugeRows) > 0 {
 			if err := m.store.InsertGauge(ctx, gaugeRows); err != nil {
 				return nil, err
