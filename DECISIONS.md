@@ -135,3 +135,7 @@ We deduplicate metadata rows in Go per request, keyed by `(MetricHash, day)` and
 We can not do cross-request deduplication without handling `LastSeen` properly, we would either need
 a separate table for it, or accept a cache's TTL as an upper bound for inaccuracy.
 
+## 11. Insert Ordering, At-Least-Once, and Orphan Metadata
+We insert metadata before datapoints in `Export`. With no cross-table transaction, the safe failure
+mode is then an orphan metadata row rather than orphan data that would break the join. Delivery is
+at-least-once, so retries may duplicate datapoints (see #4).

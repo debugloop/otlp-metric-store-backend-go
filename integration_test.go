@@ -74,6 +74,7 @@ func TestCreateTables(t *testing.T) {
 	}
 
 	expectedTables := []string{
+		"otel_metrics_metadata",
 		"otel_metrics_gauge",
 		"otel_metrics_sum",
 		"otel_metrics_histogram",
@@ -145,31 +146,42 @@ func TestInsertGauge(t *testing.T) {
 		},
 	}
 
+	if metaRows := MapMetadataRows(resourceMetrics); len(metaRows) > 0 {
+		if err := store.InsertMetadata(ctx, metaRows); err != nil {
+			t.Fatalf("inserting metadata rows: %v", err)
+		}
+	}
 	rows := MapGaugeRows(resourceMetrics)
 	if err := store.InsertGauge(ctx, rows); err != nil {
 		t.Fatalf("inserting gauge rows: %v", err)
 	}
 
-	var (
-		serviceName string
-		metricName  string
-		value       float64
-	)
-	err := store.conn.QueryRow(ctx,
-		"SELECT ServiceName, MetricName, Value FROM otel_metrics_gauge WHERE MetricName = 'cpu.utilization'",
-	).Scan(&serviceName, &metricName, &value)
-	if err != nil {
-		t.Fatalf("querying gauge: %v", err)
-	}
-
-	if serviceName != "test-service" {
-		t.Errorf("expected ServiceName=test-service, got %s", serviceName)
-	}
-	if metricName != "cpu.utilization" {
-		t.Errorf("expected MetricName=cpu.utilization, got %s", metricName)
+	// Value comes from the slim data table.
+	var value float64
+	if err := store.conn.QueryRow(ctx,
+		"SELECT Value FROM otel_metrics_gauge",
+	).Scan(&value); err != nil {
+		t.Fatalf("querying gauge value: %v", err)
 	}
 	if value != 42.5 {
 		t.Errorf("expected Value=42.5, got %f", value)
+	}
+
+	// Metadata comes from the lookup table (FINAL to force the merge).
+	var (
+		serviceName string
+		metricType  string
+	)
+	if err := store.conn.QueryRow(ctx,
+		"SELECT ResourceAttributes['service.name'], MetricType FROM otel_metrics_metadata FINAL WHERE MetricName = 'cpu.utilization'",
+	).Scan(&serviceName, &metricType); err != nil {
+		t.Fatalf("querying metadata: %v", err)
+	}
+	if serviceName != "test-service" {
+		t.Errorf("expected service.name=test-service, got %s", serviceName)
+	}
+	if metricType != "gauge" {
+		t.Errorf("expected MetricType=gauge, got %s", metricType)
 	}
 }
 
@@ -228,39 +240,46 @@ func TestInsertSum(t *testing.T) {
 		},
 	}
 
+	if metaRows := MapMetadataRows(resourceMetrics); len(metaRows) > 0 {
+		if err := store.InsertMetadata(ctx, metaRows); err != nil {
+			t.Fatalf("inserting metadata rows: %v", err)
+		}
+	}
 	rows := MapSumRows(resourceMetrics)
 	if err := store.InsertSum(ctx, rows); err != nil {
 		t.Fatalf("inserting sum rows: %v", err)
 	}
 
-	var (
-		serviceName            string
-		metricName             string
-		value                  float64
-		aggregationTemporality int32
-		isMonotonic            bool
-	)
-	err := store.conn.QueryRow(ctx,
-		"SELECT ServiceName, MetricName, Value, AggregationTemporality, IsMonotonic FROM otel_metrics_sum WHERE MetricName = 'http.requests.total'",
-	).Scan(&serviceName, &metricName, &value, &aggregationTemporality, &isMonotonic)
-	if err != nil {
-		t.Fatalf("querying sum: %v", err)
-	}
-
-	if serviceName != "test-service" {
-		t.Errorf("expected ServiceName=test-service, got %s", serviceName)
-	}
-	if metricName != "http.requests.total" {
-		t.Errorf("expected MetricName=http.requests.total, got %s", metricName)
+	// Value comes from the slim data table.
+	var value float64
+	if err := store.conn.QueryRow(ctx,
+		"SELECT Value FROM otel_metrics_sum",
+	).Scan(&value); err != nil {
+		t.Fatalf("querying sum value: %v", err)
 	}
 	if value != 1234 {
 		t.Errorf("expected Value=1234, got %f", value)
 	}
+
+	// Sum properties (temporality, monotonicity) live in metadata, not the data table.
+	var (
+		serviceName            string
+		aggregationTemporality int32
+		isMonotonic            bool
+	)
+	if err := store.conn.QueryRow(ctx,
+		"SELECT ResourceAttributes['service.name'], SumAggTemp, SumIsMonotonic FROM otel_metrics_metadata FINAL WHERE MetricName = 'http.requests.total'",
+	).Scan(&serviceName, &aggregationTemporality, &isMonotonic); err != nil {
+		t.Fatalf("querying metadata: %v", err)
+	}
+	if serviceName != "test-service" {
+		t.Errorf("expected service.name=test-service, got %s", serviceName)
+	}
 	if aggregationTemporality != 2 {
-		t.Errorf("expected AggregationTemporality=2, got %d", aggregationTemporality)
+		t.Errorf("expected SumAggTemp=2, got %d", aggregationTemporality)
 	}
 	if !isMonotonic {
-		t.Errorf("expected IsMonotonic=true, got false")
+		t.Errorf("expected SumIsMonotonic=true, got false")
 	}
 }
 
@@ -334,20 +353,26 @@ func TestGRPCToClickHouse(t *testing.T) {
 		t.Fatalf("exporting metrics via grpc: %v", err)
 	}
 
-	// Verify the metric landed in ClickHouse.
+	// Verify end-to-end via the metadata <-> data hash join, demonstrating the
+	// table relationship: service.name lives in metadata, Value in the data table.
 	var (
-		svcName    string
-		metricName string
-		value      float64
+		svcName string
+		value   float64
 	)
 	err = store.conn.QueryRow(ctx,
-		"SELECT ServiceName, MetricName, Value FROM otel_metrics_gauge WHERE MetricName = 'e2e.gauge'",
-	).Scan(&svcName, &metricName, &value)
+		`SELECT m.svc, g.Value
+		 FROM otel_metrics_gauge g
+		 INNER JOIN (
+		     SELECT MetricHash, ResourceAttributes['service.name'] AS svc
+		     FROM otel_metrics_metadata FINAL
+		 ) m ON g.MetricHash = m.MetricHash
+		 WHERE m.svc = 'e2e-service'`,
+	).Scan(&svcName, &value)
 	if err != nil {
 		t.Fatalf("querying clickhouse: %v", err)
 	}
 	if svcName != "e2e-service" {
-		t.Errorf("expected ServiceName=e2e-service, got %s", svcName)
+		t.Errorf("expected service.name=e2e-service, got %s", svcName)
 	}
 	if value != 99.9 {
 		t.Errorf("expected Value=99.9, got %f", value)
