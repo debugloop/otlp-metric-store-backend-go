@@ -212,6 +212,9 @@ func MapMetadataRows(resourceMetrics []*metricspb.ResourceMetrics) []MetricMetad
 				}
 
 				for _, dp := range dps {
+					if !dataPointValid(metric.GetName(), dp) {
+						continue
+					}
 					dpAttrs := kvToMap(dp.GetAttributes())
 					hash := computeMetricHash(
 						metricType, metric.GetName(),
@@ -282,6 +285,9 @@ func MapGaugeRows(resourceMetrics []*metricspb.ResourceMetrics) []GaugeDataRow {
 					continue
 				}
 				for _, dp := range gauge.GetDataPoints() {
+					if !dataPointValid(metric.GetName(), dp) {
+						continue
+					}
 					hash := computeMetricHash(
 						"gauge", metric.GetName(),
 						resAttrs, resSchemaUrl,
@@ -320,6 +326,9 @@ func MapSumRows(resourceMetrics []*metricspb.ResourceMetrics) []SumDataRow {
 					continue
 				}
 				for _, dp := range sum.GetDataPoints() {
+					if !dataPointValid(metric.GetName(), dp) {
+						continue
+					}
 					hash := computeMetricHash(
 						"sum", metric.GetName(),
 						resAttrs, resSchemaUrl,

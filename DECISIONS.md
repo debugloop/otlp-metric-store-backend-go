@@ -139,3 +139,14 @@ a separate table for it, or accept a cache's TTL as an upper bound for inaccurac
 We insert metadata before datapoints in `Export`. With no cross-table transaction, the safe failure
 mode is then an orphan metadata row rather than orphan data that would break the join. Delivery is
 at-least-once, so retries may duplicate datapoints (see #4).
+
+## 12. Ingest Throughput: `async_insert` + In-Flight Admission Control
+We signal backpressure to the client instead of buffering: an in-flight admission limiter (a
+process-wide `maxInFlightExports` semaphore in a gRPC interceptor) sheds excess load immediately
+with `RESOURCE_EXHAUSTED` + a `RetryInfo` hint, bounding memory at roughly `maxInFlightExports *
+maxReceiveMessageSize` rather than letting a queue grow unbounded.
+Durable throughput comes from `async_insert` (`wait_for_async_insert=1`), which coalesces many small
+inserts into few parts server-side without a Collector while staying error-returning, so
+at-least-once retry semantics hold (#4, #11). The limiter is global, not per-tenant, so a noisy
+exporter can starve others. Fairness, batching, and queue/health-based backpressure are not
+considered for now.
