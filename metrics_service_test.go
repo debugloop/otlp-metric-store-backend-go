@@ -138,6 +138,44 @@ func TestExportAllValid(t *testing.T) {
 	}
 }
 
+// TestExportUnsupportedTypeRejected: a histogram metric is not stored, but its
+// datapoints are counted as rejected and surfaced via partial_success rather than
+// silently dropped.
+func TestExportUnsupportedTypeRejected(t *testing.T) {
+	fake := &fakeStore{}
+	srv := newServer("test", fake)
+	now := uint64(time.Now().UnixNano())
+
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{{
+			ScopeMetrics: []*metricspb.ScopeMetrics{{
+				Scope: &commonpb.InstrumentationScope{Name: "scope"},
+				Metrics: []*metricspb.Metric{{
+					Name: "request.duration",
+					Data: &metricspb.Metric_Histogram{Histogram: &metricspb.Histogram{
+						DataPoints: []*metricspb.HistogramDataPoint{
+							{TimeUnixNano: now},
+							{TimeUnixNano: now},
+						},
+					}},
+				}},
+			}},
+		}},
+	}
+
+	resp, err := srv.Export(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Export returned error: %v", err)
+	}
+	if got := resp.GetPartialSuccess().GetRejectedDataPoints(); got != 2 {
+		t.Fatalf("expected 2 rejected datapoints for the histogram, got %d", got)
+	}
+	if fake.metadataRows != 0 || fake.gaugeRows != 0 || fake.sumRows != 0 {
+		t.Fatalf("expected nothing stored for an unsupported type, got metadata=%d gauge=%d sum=%d",
+			fake.metadataRows, fake.gaugeRows, fake.sumRows)
+	}
+}
+
 // TestExportEmptyNameRejected: an empty metric name rejects all its datapoints.
 func TestExportEmptyNameRejected(t *testing.T) {
 	fake := &fakeStore{}

@@ -164,6 +164,23 @@ func computeMetricHash(
 	return city.CH64(b)
 }
 
+// unsupportedDataPointCount returns the number of datapoints in a metric whose
+// type we do not map (histogram, exponential histogram, summary, or an unset
+// data oneof). These are counted as rejected so an unsupported type is a visible
+// drop via partial_success, never a silent one.
+func unsupportedDataPointCount(metric *metricspb.Metric) int64 {
+	switch metric.GetData().(type) {
+	case *metricspb.Metric_Histogram:
+		return int64(len(metric.GetHistogram().GetDataPoints()))
+	case *metricspb.Metric_ExponentialHistogram:
+		return int64(len(metric.GetExponentialHistogram().GetDataPoints()))
+	case *metricspb.Metric_Summary:
+		return int64(len(metric.GetSummary().GetDataPoints()))
+	default:
+		return 0
+	}
+}
+
 // metricTypeInfo returns the metric type string and, for sums, the aggregation
 // temporality and monotonicity. These describe how the series is encoded and
 // live in metadata, not in the hash. Only gauge and sum are mapped.
@@ -179,15 +196,29 @@ func metricTypeInfo(metric *metricspb.Metric) (metricType string, sumAggTemp int
 	}
 }
 
-// MapMetadataRows extracts the metadata lookup rows for all gauge and sum
-// datapoints, deduplicated per (MetricHash, day) with FirstSeen/LastSeen folded
-// across the datapoints that share a key.
-func MapMetadataRows(resourceMetrics []*metricspb.ResourceMetrics) []MetricMetadataRow {
+// MappedBatch is the result of a single pass over an Export request: the slim
+// gauge/sum data rows (one per valid datapoint), the metadata lookup rows
+// deduplicated per (MetricHash, day), and the count of datapoints dropped by
+// validation (reported to the client via partial_success).
+type MappedBatch struct {
+	Metadata []MetricMetadataRow
+	Gauge    []GaugeDataRow
+	Sum      []SumDataRow
+	Rejected int64
+}
+
+// MapRequest walks the request once, building the slim data rows and the
+// deduplicated metadata rows together. The MetricHash and the datapoint
+// attribute map are computed exactly once per datapoint and shared between the
+// data row and the metadata row — the prior split mappers recomputed both per
+// pass. Resource/scope attribute maps stay hoisted per ResourceMetrics/Scope.
+func MapRequest(resourceMetrics []*metricspb.ResourceMetrics) MappedBatch {
 	type key struct {
 		hash uint64
 		day  int64
 	}
 	dedup := make(map[key]*MetricMetadataRow)
+	var batch MappedBatch
 
 	for _, rm := range resourceMetrics {
 		resAttrs := kvToMap(rm.GetResource().GetAttributes())
@@ -208,24 +239,62 @@ func MapMetadataRows(resourceMetrics []*metricspb.ResourceMetrics) []MetricMetad
 				case "sum":
 					dps = metric.GetSum().GetDataPoints()
 				default:
+					// Histogram/summary/exp-histogram aren't mapped yet; count their
+					// datapoints as rejected so the drop surfaces in partial_success.
+					batch.Rejected += unsupportedDataPointCount(metric)
 					continue
 				}
 
+				name := metric.GetName()
+				// The identity prefix (type, name, resource, scope) is invariant
+				// across this metric's datapoints; build it once and append only the
+				// per-datapoint attributes when hashing each point. hashBuf is reused
+				// across the datapoints so only one backing array is grown per metric.
+				prefix := seriesHashPrefix(
+					metricType, name,
+					rm.GetResource().GetAttributes(), resSchemaUrl,
+					scope.GetName(), scope.GetVersion(), scope.GetAttributes(), scopeSchemaUrl,
+				)
+				var hashBuf []byte
+
 				for _, dp := range dps {
-					if !dataPointValid(metric.GetName(), dp) {
+					if !dataPointValid(name, dp) {
+						batch.Rejected++
 						continue
 					}
 					dpAttrs := kvToMap(dp.GetAttributes())
 					hash := computeMetricHash(
-						metricType, metric.GetName(),
+						metricType, name,
 						resAttrs, resSchemaUrl,
 						scope.GetName(), scope.GetVersion(), scopeAttrs, scopeSchemaUrl,
 						dpAttrs,
 					)
 					t := nanosToTime(dp.GetTimeUnixNano())
+
+					// Slim data row: one per valid datapoint, no dedup.
+					switch metricType {
+					case "gauge":
+						batch.Gauge = append(batch.Gauge, GaugeDataRow{
+							MetricHash:    hash,
+							StartTimeUnix: nanosToTime(dp.GetStartTimeUnixNano()),
+							TimeUnix:      t,
+							Value:         numberDataPointValue(dp),
+							Flags:         dp.GetFlags(),
+						})
+					case "sum":
+						batch.Sum = append(batch.Sum, SumDataRow{
+							MetricHash:    hash,
+							StartTimeUnix: nanosToTime(dp.GetStartTimeUnixNano()),
+							TimeUnix:      t,
+							Value:         numberDataPointValue(dp),
+							Flags:         dp.GetFlags(),
+						})
+					}
+
+					// Metadata row: deduplicated per (hash, day), folding the
+					// FirstSeen/LastSeen window across datapoints sharing a key.
 					day := t.UTC().Truncate(24 * time.Hour)
 					k := key{hash: hash, day: day.Unix()}
-
 					if row, ok := dedup[k]; ok {
 						if t.Before(row.FirstSeen) {
 							row.FirstSeen = t
@@ -235,9 +304,10 @@ func MapMetadataRows(resourceMetrics []*metricspb.ResourceMetrics) []MetricMetad
 						}
 						continue
 					}
+					dpAttrs := kvToMap(dp.GetAttributes())
 					dedup[k] = &MetricMetadataRow{
 						TimeUnix:              day,
-						MetricName:            metric.GetName(),
+						MetricName:            name,
 						MetricHash:            hash,
 						FirstSeen:             t,
 						LastSeen:              t,
@@ -260,91 +330,9 @@ func MapMetadataRows(resourceMetrics []*metricspb.ResourceMetrics) []MetricMetad
 		}
 	}
 
-	rows := make([]MetricMetadataRow, 0, len(dedup))
+	batch.Metadata = make([]MetricMetadataRow, 0, len(dedup))
 	for _, r := range dedup {
-		rows = append(rows, *r)
+		batch.Metadata = append(batch.Metadata, *r)
 	}
-	return rows
-}
-
-// MapGaugeRows converts all Gauge datapoints into slim GaugeDataRows.
-func MapGaugeRows(resourceMetrics []*metricspb.ResourceMetrics) []GaugeDataRow {
-	var rows []GaugeDataRow
-	for _, rm := range resourceMetrics {
-		resAttrs := kvToMap(rm.GetResource().GetAttributes())
-		resSchemaUrl := rm.GetSchemaUrl()
-
-		for _, sm := range rm.GetScopeMetrics() {
-			scope := sm.GetScope()
-			scopeAttrs := kvToMap(scope.GetAttributes())
-			scopeSchemaUrl := sm.GetSchemaUrl()
-
-			for _, metric := range sm.GetMetrics() {
-				gauge := metric.GetGauge()
-				if gauge == nil {
-					continue
-				}
-				for _, dp := range gauge.GetDataPoints() {
-					if !dataPointValid(metric.GetName(), dp) {
-						continue
-					}
-					hash := computeMetricHash(
-						"gauge", metric.GetName(),
-						resAttrs, resSchemaUrl,
-						scope.GetName(), scope.GetVersion(), scopeAttrs, scopeSchemaUrl,
-						kvToMap(dp.GetAttributes()),
-					)
-					rows = append(rows, GaugeDataRow{
-						MetricHash:    hash,
-						StartTimeUnix: nanosToTime(dp.GetStartTimeUnixNano()),
-						TimeUnix:      nanosToTime(dp.GetTimeUnixNano()),
-						Value:         numberDataPointValue(dp),
-						Flags:         dp.GetFlags(),
-					})
-				}
-			}
-		}
-	}
-	return rows
-}
-
-// MapSumRows converts all Sum datapoints into slim SumDataRows.
-func MapSumRows(resourceMetrics []*metricspb.ResourceMetrics) []SumDataRow {
-	var rows []SumDataRow
-	for _, rm := range resourceMetrics {
-		resAttrs := kvToMap(rm.GetResource().GetAttributes())
-		resSchemaUrl := rm.GetSchemaUrl()
-
-		for _, sm := range rm.GetScopeMetrics() {
-			scope := sm.GetScope()
-			scopeAttrs := kvToMap(scope.GetAttributes())
-			scopeSchemaUrl := sm.GetSchemaUrl()
-
-			for _, metric := range sm.GetMetrics() {
-				sum := metric.GetSum()
-				if sum == nil {
-					continue
-				}
-				for _, dp := range sum.GetDataPoints() {
-					if !dataPointValid(metric.GetName(), dp) {
-						continue
-					}
-					hash := computeMetricHash(
-						"sum", metric.GetName(),
-						resAttrs, resSchemaUrl,
-						scope.GetName(), scope.GetVersion(), scopeAttrs, scopeSchemaUrl,
-						kvToMap(dp.GetAttributes()),
-					)
-					rows = append(rows, SumDataRow{
-						MetricHash:    hash,
-						StartTimeUnix: nanosToTime(dp.GetStartTimeUnixNano()),
-						TimeUnix:      nanosToTime(dp.GetTimeUnixNano()),
-						Value:         numberDataPointValue(dp),
-						Flags:         dp.GetFlags(),
-					})
-				}
-			}
-		}
-	}
-	return rows
+	return batch
 }

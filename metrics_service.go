@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log/slog"
-	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -36,46 +35,47 @@ func (m *dash0MetricsServiceServer) Export(ctx context.Context, request *colmetr
 	resp := &colmetricspb.ExportMetricsServiceResponse{}
 
 	rm := request.GetResourceMetrics()
-	rejected := countInvalidDataPoints(rm)
-
-	metaRows := MapMetadataRows(rm)
-	gaugeRows := MapGaugeRows(rm)
-	sumRows := MapSumRows(rm)
+	mapped := MapRequest(rm)
 
 	// Metadata first so a later failure leaves an orphan metadata row (harmless)
 	// rather than orphan datapoints that would break the join (DECISIONS #11).
-	if err := m.insertBatch(ctx, "metadata", len(metaRows), func() error { return m.store.InsertMetadata(ctx, metaRows) }); err != nil {
-		return nil, err
-	}
-	if err := m.insertBatch(ctx, "gauge", len(gaugeRows), func() error { return m.store.InsertGauge(ctx, gaugeRows) }); err != nil {
-		return nil, err
-	}
-	if err := m.insertBatch(ctx, "sum", len(sumRows), func() error { return m.store.InsertSum(ctx, sumRows) }); err != nil {
+	if err := m.insertBatch(ctx, "metadata", len(mapped.Metadata), func(ctx context.Context) error { return m.store.InsertMetadata(ctx, mapped.Metadata) }); err != nil {
 		return nil, err
 	}
 
-	metadataRowsInsertedCounter.Add(ctx, int64(len(metaRows)))
-	if len(gaugeRows) > 0 {
-		dataPointsInsertedCounter.Add(ctx, int64(len(gaugeRows)), metric.WithAttributes(attribute.String("metric.type", "gauge")))
+	// Gauge then sum, sequentially. Each PrepareBatch holds a pooled ClickHouse
+	// connection until Send, so a single admitted Export peaks at one connection
+	// here — keeping the maxInFlightExports <= clickhouseMaxOpenConns invariant
+	// true (DECISIONS #12) instead of demanding two connections per request.
+	if err := m.insertBatch(ctx, "gauge", len(mapped.Gauge), func(ctx context.Context) error { return m.store.InsertGauge(ctx, mapped.Gauge) }); err != nil {
+		return nil, err
 	}
-	if len(sumRows) > 0 {
-		dataPointsInsertedCounter.Add(ctx, int64(len(sumRows)), metric.WithAttributes(attribute.String("metric.type", "sum")))
+	if err := m.insertBatch(ctx, "sum", len(mapped.Sum), func(ctx context.Context) error { return m.store.InsertSum(ctx, mapped.Sum) }); err != nil {
+		return nil, err
 	}
 
-	if rejected > 0 {
-		rejectedDataPointsCounter.Add(ctx, rejected)
-		slog.WarnContext(ctx, "rejected invalid datapoints", slog.Int64("count", rejected))
+	metadataRowsInsertedCounter.Add(ctx, int64(len(mapped.Metadata)))
+	if len(mapped.Gauge) > 0 {
+		dataPointsInsertedCounter.Add(ctx, int64(len(mapped.Gauge)), metric.WithAttributes(attribute.String("metric.type", "gauge")))
+	}
+	if len(mapped.Sum) > 0 {
+		dataPointsInsertedCounter.Add(ctx, int64(len(mapped.Sum)), metric.WithAttributes(attribute.String("metric.type", "sum")))
+	}
+
+	if mapped.Rejected > 0 {
+		rejectedDataPointsCounter.Add(ctx, mapped.Rejected)
+		slog.WarnContext(ctx, "rejected invalid datapoints", slog.Int64("count", mapped.Rejected))
 		resp.PartialSuccess = &colmetricspb.ExportMetricsPartialSuccess{
-			RejectedDataPoints: rejected,
-			ErrorMessage:       "rejected datapoints failed validation (empty metric name, missing timestamp, or too many attributes)",
+			RejectedDataPoints: mapped.Rejected,
+			ErrorMessage:       "rejected datapoints failed validation (empty metric name, missing timestamp, or too many attributes) or are an unsupported metric type (only gauge and sum are stored)",
 		}
 	}
 
 	slog.DebugContext(ctx, "stored metrics",
-		slog.Int("metadata_rows", len(metaRows)),
-		slog.Int("gauge_rows", len(gaugeRows)),
-		slog.Int("sum_rows", len(sumRows)),
-		slog.Int64("rejected", rejected))
+		slog.Int("metadata_rows", len(mapped.Metadata)),
+		slog.Int("gauge_rows", len(mapped.Gauge)),
+		slog.Int("sum_rows", len(mapped.Sum)),
+		slog.Int64("rejected", mapped.Rejected))
 
 	return resp, nil
 }

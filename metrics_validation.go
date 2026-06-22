@@ -10,9 +10,9 @@ const maxDataPointAttributes = 128
 
 // dataPointValid reports whether a gauge/sum datapoint is well-formed enough to
 // store: a non-empty metric name, a set event timestamp (so it can be placed in a
-// time partition), and a bounded attribute count. It is the single predicate
-// shared by the mappers (which skip invalid points) and countInvalidDataPoints
-// (which reports them), so the two never diverge.
+// time partition), and a bounded attribute count. MapRequest applies it as the
+// single predicate for both dropping a datapoint and counting it as rejected, so
+// the stored rows and the partial_success count never diverge.
 func dataPointValid(metricName string, dp *metricspb.NumberDataPoint) bool {
 	switch {
 	case metricName == "":
@@ -24,32 +24,4 @@ func dataPointValid(metricName string, dp *metricspb.NumberDataPoint) bool {
 	default:
 		return true
 	}
-}
-
-// countInvalidDataPoints returns how many gauge/sum datapoints in the request
-// fail validation (and are therefore dropped by the mappers). Unmapped metric
-// types are not counted.
-func countInvalidDataPoints(resourceMetrics []*metricspb.ResourceMetrics) int64 {
-	var n int64
-	for _, rm := range resourceMetrics {
-		for _, sm := range rm.GetScopeMetrics() {
-			for _, m := range sm.GetMetrics() {
-				var dps []*metricspb.NumberDataPoint
-				switch m.GetData().(type) {
-				case *metricspb.Metric_Gauge:
-					dps = m.GetGauge().GetDataPoints()
-				case *metricspb.Metric_Sum:
-					dps = m.GetSum().GetDataPoints()
-				default:
-					continue
-				}
-				for _, dp := range dps {
-					if !dataPointValid(m.GetName(), dp) {
-						n++
-					}
-				}
-			}
-		}
-	}
-	return n
 }
