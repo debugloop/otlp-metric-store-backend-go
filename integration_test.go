@@ -153,13 +153,13 @@ func TestInsertGauge(t *testing.T) {
 		},
 	}
 
-	if metaRows := MapMetadataRows(resourceMetrics); len(metaRows) > 0 {
-		if err := store.InsertMetadata(ctx, metaRows); err != nil {
+	mapped := MapRequest(resourceMetrics)
+	if len(mapped.Metadata) > 0 {
+		if err := store.InsertMetadata(ctx, mapped.Metadata); err != nil {
 			t.Fatalf("inserting metadata rows: %v", err)
 		}
 	}
-	rows := MapGaugeRows(resourceMetrics)
-	if err := store.InsertGauge(ctx, rows); err != nil {
+	if err := store.InsertGauge(ctx, mapped.Gauge); err != nil {
 		t.Fatalf("inserting gauge rows: %v", err)
 	}
 
@@ -247,13 +247,13 @@ func TestInsertSum(t *testing.T) {
 		},
 	}
 
-	if metaRows := MapMetadataRows(resourceMetrics); len(metaRows) > 0 {
-		if err := store.InsertMetadata(ctx, metaRows); err != nil {
+	mapped := MapRequest(resourceMetrics)
+	if len(mapped.Metadata) > 0 {
+		if err := store.InsertMetadata(ctx, mapped.Metadata); err != nil {
 			t.Fatalf("inserting metadata rows: %v", err)
 		}
 	}
-	rows := MapSumRows(resourceMetrics)
-	if err := store.InsertSum(ctx, rows); err != nil {
+	if err := store.InsertSum(ctx, mapped.Sum); err != nil {
 		t.Fatalf("inserting sum rows: %v", err)
 	}
 
