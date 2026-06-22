@@ -37,7 +37,7 @@
     * Is non-cryptographic since we don't require collision resistance
     * Is sufficiently performant
     * Is a builtin function in ClickHouse, should we ever need that in queries
-    * Has sufficient headroom regarding conflicts (2^32 series)
+    * Has sufficient headroom regarding random conflicts (2^32 series)
 
     We will use all the attributes in the hash, as the identity of the series is determined by the
     full set. Descriptive but mutable fields (e.g. the metric description and unit) are deliberately
@@ -46,7 +46,9 @@
     They are also type-specific, so hashing them would make the input type-dependent. To guarantee
     the reference hash's stability the attribute keys are sorted. A byte (0xff, analogous to
     Prometheus' label hashing) separates the field values, as potentially different sets of
-    attributes could yield the same pre-hash byte sequence otherwise.
+    attributes could yield the same pre-hash byte sequence otherwise. This guards against
+    structural collisions. For the same reason each attribute value carries a one-byte type tag, so
+    values sharing a textual form across types do not alias onto one series.
 - **Tradeoff / alternative:** While an argument can be made for surrogate IDs, especially with the
     stated low cardinality, the main reason is the prospect of scaling this backend horizontally
     without needing synchronization. There are a number of functionally equivalent hash functions

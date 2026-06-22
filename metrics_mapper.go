@@ -1,13 +1,16 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/go-faster/city"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // kvToMap converts a slice of OTLP KeyValue pairs to a Go map.
@@ -38,6 +41,34 @@ func anyValueToString(v *commonpb.AnyValue) string {
 	}
 }
 
+// anyValueHashToken renders an AnyValue for the identity hash with a one-byte
+// type tag, so values that share a textual form across types — int 1, double 1.0,
+// string "1", bool true — produce distinct hash input and therefore distinct
+// series. The stored attribute maps keep the untagged anyValueToString form, so
+// queries still see the raw value.
+func anyValueHashToken(v *commonpb.AnyValue) string {
+	switch v.GetValue().(type) {
+	case *commonpb.AnyValue_StringValue:
+		return "s:" + v.GetStringValue()
+	case *commonpb.AnyValue_IntValue:
+		return "i:" + strconv.FormatInt(v.GetIntValue(), 10)
+	case *commonpb.AnyValue_DoubleValue:
+		return "d:" + strconv.FormatFloat(v.GetDoubleValue(), 'g', -1, 64)
+	case *commonpb.AnyValue_BoolValue:
+		return "b:" + strconv.FormatBool(v.GetBoolValue())
+	default:
+		// Array / Kvlist / Bytes: deterministic proto bytes, hex-encoded so the
+		// token is injective for nested/binary values and contains no 0xFF
+		// separator byte. Only the rare composite case pays this; scalars stay on
+		// the cheap path above.
+		data, err := proto.MarshalOptions{Deterministic: true}.Marshal(v)
+		if err != nil {
+			return "x:" + anyValueToString(v)
+		}
+		return "x:" + hex.EncodeToString(data)
+	}
+}
+
 // nanosToTime converts a uint64 nanoseconds-since-epoch to time.Time.
 func nanosToTime(nanos uint64) time.Time {
 	return time.Unix(0, int64(nanos))
@@ -61,48 +92,53 @@ const hashSeparator = 0xFF
 
 // computeMetricHash returns a deterministic cityHash64 over the fields that
 // uniquely identify a series. The 0xFF boundary byte after each field prevents
-// distinct field splits from producing identical input; map keys are sorted so
-// Go's randomized map iteration order cannot change the result.
+// distinct field splits from producing identical input; attribute keys are sorted
+// so Go's randomized iteration order cannot change the result, and each value
+// carries a type tag (anyValueHashToken) so cross-type values do not collide.
 func computeMetricHash(
 	metricType string,
 	metricName string,
-	resAttrs map[string]string,
+	resAttrs []*commonpb.KeyValue,
 	resSchemaUrl string,
 	scopeName string,
 	scopeVersion string,
-	scopeAttrs map[string]string,
+	scopeAttrs []*commonpb.KeyValue,
 	scopeSchemaUrl string,
-	metricAttrs map[string]string,
+	metricAttrs []*commonpb.KeyValue,
 ) uint64 {
 	var b []byte
 	appendField := func(s string) {
 		b = append(b, s...)
 		b = append(b, hashSeparator)
 	}
-	appendMap := func(m map[string]string) {
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			b = append(b, k...)
+	appendKVs := func(kvs []*commonpb.KeyValue) {
+		sorted := make([]*commonpb.KeyValue, len(kvs))
+		copy(sorted, kvs)
+		// Stable sort keeps a run of equal keys in input order, so dropping all but
+		// the last entry of each run yields last-wins dedup matching kvToMap (the
+		// stored attribute map) and a deterministic byte sequence for any input.
+		sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].GetKey() < sorted[j].GetKey() })
+		for i, kv := range sorted {
+			if i+1 < len(sorted) && sorted[i+1].GetKey() == kv.GetKey() {
+				continue
+			}
+			b = append(b, kv.GetKey()...)
 			b = append(b, hashSeparator)
-			b = append(b, m[k]...)
+			b = append(b, anyValueHashToken(kv.GetValue())...)
 			b = append(b, hashSeparator)
 		}
-		b = append(b, hashSeparator) // map terminator (distinguishes empty map from empty string)
+		b = append(b, hashSeparator) // terminator (distinguishes empty map from empty string)
 	}
 
 	appendField(metricType)
 	appendField(metricName)
-	appendMap(resAttrs)
+	appendKVs(resAttrs)
 	appendField(resSchemaUrl)
 	appendField(scopeName)
 	appendField(scopeVersion)
-	appendMap(scopeAttrs)
+	appendKVs(scopeAttrs)
 	appendField(scopeSchemaUrl)
-	appendMap(metricAttrs)
+	appendKVs(metricAttrs)
 
 	return city.CH64(b)
 }
@@ -177,9 +213,9 @@ func MapRequest(resourceMetrics []*metricspb.ResourceMetrics) MappedBatch {
 					dpAttrs := kvToMap(dp.GetAttributes())
 					hash := computeMetricHash(
 						metricType, name,
-						resAttrs, resSchemaUrl,
-						scope.GetName(), scope.GetVersion(), scopeAttrs, scopeSchemaUrl,
-						dpAttrs,
+						rm.GetResource().GetAttributes(), resSchemaUrl,
+						scope.GetName(), scope.GetVersion(), scope.GetAttributes(), scopeSchemaUrl,
+						dp.GetAttributes(),
 					)
 					t := nanosToTime(dp.GetTimeUnixNano())
 
