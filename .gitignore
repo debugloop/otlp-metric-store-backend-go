@@ -10,3 +10,7 @@ PERSONAL-NOTES.md
 
 # Full third-party article kept locally for agent context, not redistributed (cited instead)
 docs/reference/dash0-blog-post.full.md
+
+# Nix build artifacts
+.direnv/
+result
