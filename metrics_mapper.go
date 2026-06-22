@@ -1,13 +1,16 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/go-faster/city"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // kvToMap converts a slice of OTLP KeyValue pairs to a Go map.
@@ -34,7 +37,38 @@ func anyValueToString(v *commonpb.AnyValue) string {
 	case *commonpb.AnyValue_BoolValue:
 		return fmt.Sprintf("%t", v.GetBoolValue())
 	default:
+		// Composite values (Array/Kvlist/Bytes) render as unstable prototext, which
+		// is unfilterable by value in the metadata table (e.g. host.ip). Identity is
+		// unaffected (anyValueHashToken uses proto+hex). Deferred; fix is OTLP/JSON.
 		return fmt.Sprintf("%v", v)
+	}
+}
+
+// anyValueHashToken renders an AnyValue for the identity hash with a one-byte
+// type tag, so values that share a textual form across types — int 1, double 1.0,
+// string "1", bool true — produce distinct hash input and therefore distinct
+// series. The stored attribute maps keep the untagged anyValueToString form, so
+// queries still see the raw value.
+func anyValueHashToken(v *commonpb.AnyValue) string {
+	switch v.GetValue().(type) {
+	case *commonpb.AnyValue_StringValue:
+		return "s:" + v.GetStringValue()
+	case *commonpb.AnyValue_IntValue:
+		return "i:" + strconv.FormatInt(v.GetIntValue(), 10)
+	case *commonpb.AnyValue_DoubleValue:
+		return "d:" + strconv.FormatFloat(v.GetDoubleValue(), 'g', -1, 64)
+	case *commonpb.AnyValue_BoolValue:
+		return "b:" + strconv.FormatBool(v.GetBoolValue())
+	default:
+		// Array / Kvlist / Bytes: deterministic proto bytes, hex-encoded so the
+		// token is injective for nested/binary values and contains no 0xFF
+		// separator byte. Only the rare composite case pays this; scalars stay on
+		// the cheap path above.
+		data, err := proto.MarshalOptions{Deterministic: true}.Marshal(v)
+		if err != nil {
+			return "x:" + anyValueToString(v)
+		}
+		return "x:" + hex.EncodeToString(data)
 	}
 }
 
@@ -117,51 +151,26 @@ func seriesHashPrefix(
 }
 
 // computeMetricHash returns a deterministic cityHash64 over the fields that
-// uniquely identify a series. The 0xFF boundary byte after each field prevents
-// distinct field splits from producing identical input; map keys are sorted so
-// Go's randomized map iteration order cannot change the result.
+// uniquely identify a series: the metric-invariant prefix plus this datapoint's
+// attributes. The 0xFF boundary byte after each field prevents distinct field
+// splits from producing identical input; attribute keys are sorted so Go's
+// randomized iteration order cannot change the result, and each value carries a
+// type tag (anyValueHashToken) so cross-type values do not collide. Hot ingest
+// uses seriesHashPrefix + hashAppendKVs directly to reuse the prefix; this helper
+// is the single-shot equivalent kept for callers (and tests) that hash one series.
 func computeMetricHash(
 	metricType string,
 	metricName string,
-	resAttrs map[string]string,
+	resAttrs []*commonpb.KeyValue,
 	resSchemaUrl string,
 	scopeName string,
 	scopeVersion string,
-	scopeAttrs map[string]string,
+	scopeAttrs []*commonpb.KeyValue,
 	scopeSchemaUrl string,
-	metricAttrs map[string]string,
+	metricAttrs []*commonpb.KeyValue,
 ) uint64 {
-	var b []byte
-	appendField := func(s string) {
-		b = append(b, s...)
-		b = append(b, hashSeparator)
-	}
-	appendMap := func(m map[string]string) {
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			b = append(b, k...)
-			b = append(b, hashSeparator)
-			b = append(b, m[k]...)
-			b = append(b, hashSeparator)
-		}
-		b = append(b, hashSeparator) // map terminator (distinguishes empty map from empty string)
-	}
-
-	appendField(metricType)
-	appendField(metricName)
-	appendMap(resAttrs)
-	appendField(resSchemaUrl)
-	appendField(scopeName)
-	appendField(scopeVersion)
-	appendMap(scopeAttrs)
-	appendField(scopeSchemaUrl)
-	appendMap(metricAttrs)
-
-	return city.CH64(b)
+	prefix := seriesHashPrefix(metricType, metricName, resAttrs, resSchemaUrl, scopeName, scopeVersion, scopeAttrs, scopeSchemaUrl)
+	return city.CH64(hashAppendKVs(prefix, metricAttrs))
 }
 
 // unsupportedDataPointCount returns the number of datapoints in a metric whose
@@ -262,13 +271,8 @@ func MapRequest(resourceMetrics []*metricspb.ResourceMetrics) MappedBatch {
 						batch.Rejected++
 						continue
 					}
-					dpAttrs := kvToMap(dp.GetAttributes())
-					hash := computeMetricHash(
-						metricType, name,
-						resAttrs, resSchemaUrl,
-						scope.GetName(), scope.GetVersion(), scopeAttrs, scopeSchemaUrl,
-						dpAttrs,
-					)
+					hashBuf = hashAppendKVs(append(hashBuf[:0], prefix...), dp.GetAttributes())
+					hash := city.CH64(hashBuf)
 					t := nanosToTime(dp.GetTimeUnixNano())
 
 					// Slim data row: one per valid datapoint, no dedup.
